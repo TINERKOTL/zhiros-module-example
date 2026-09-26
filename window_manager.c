@@ -14,8 +14,6 @@
 #define MAX_WINDOWS 8
 #define MAX_WINDOW_WIDTH 800
 #define MAX_WINDOW_HEIGHT 600
-#define TERM_LINES 12
-#define TERM_COLS 40
 
 u32 (*getchar)();
 void *(*alloc)(u32 size);
@@ -45,13 +43,13 @@ struct Window{
     char *name;
 };
 
-bool close_window = false;
 bool changed = false;
+static bool window_full = false;
 
-u32 WINDOW_HEADER_Y = 20;
 u8 *second_buffer = 0;
 u32 second_buffer_size = 0;
 u32 mouse_x = 0, mouse_y = 0;
+u32 old_x, old_y, old_width, old_height;
 
 Window windows[MAX_WINDOWS];
 Window *z_order[MAX_WINDOWS];
@@ -59,7 +57,7 @@ u32 window_count = 0;
 Window *active_window = 0;
 u32 active_index = 0;
 
-static const u32 arrow_cursor[11][6] = {
+static u32 arrow_cursor[11][6] = {
     {1, 0, 0, 0, 0, 0},
     {1, 1, 0, 0, 0, 0},
     {1, 1, 1, 0, 0, 0},
@@ -71,6 +69,34 @@ static const u32 arrow_cursor[11][6] = {
     {1, 0, 1, 1, 1, 0},
     {0, 0, 0, 1, 1, 0},
     {0, 0, 0, 0, 1, 1}
+};
+
+static u32 arrow_cursor_height[11][6] = {
+    {0, 0, 1, 1, 0, 0},
+    {0, 1, 1, 1, 1, 0},
+    {1, 1, 1, 1, 1, 1},
+    {1, 0, 1, 1, 0, 1},
+    {0, 0, 1, 1, 0, 0},
+    {0, 0, 1, 1, 0, 0},
+    {0, 0, 1, 1, 0, 0},
+    {1, 0, 1, 1, 0, 1},
+    {1, 1, 1, 1, 1, 1},
+    {0, 1, 1, 1, 1, 0},
+    {0, 0, 1, 1, 0, 0}
+};
+
+static u32 arrow_cursor_width[11][6] = {
+    {0, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0},
+    {0, 1, 0, 0, 1, 0},
+    {1, 1, 0, 0, 1, 1},
+    {1, 1, 1, 1, 1, 1},
+    {1, 1, 1, 1, 1, 1},
+    {1, 1, 1, 1, 1, 1},
+    {1, 1, 0, 0, 1, 1},
+    {0, 1, 0, 0, 1, 0},
+    {0, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0}
 };
 
 static const u32 window_icon_1[5][5] = {
@@ -102,7 +128,7 @@ static const u32 window_icon_3[10][8] = {
     {0, 0, 1, 1, 1, 1, 1, 1},
 };
 
-Window *free_window_slot() {
+static Window *free_window_slot() {
     for (u32 i = 0; i < MAX_WINDOWS; i++) {
         if (windows[i].buffer == 0)
             return &windows[i];
@@ -111,7 +137,7 @@ Window *free_window_slot() {
     return 0;
 }
 
-Window *window_create(char *name) {
+static Window *window_create(char *name) {
     if (window_count >= MAX_WINDOWS)
         return 0;
 
@@ -144,7 +170,7 @@ Window *window_create(char *name) {
     return window;
 }
 
-void window_destroy(Window *window) {
+static void window_destroy(Window *window) {
     if (!window)
         return;
     
@@ -175,7 +201,7 @@ void window_destroy(Window *window) {
     changed = true;
 }
 
-void present_framebuffer() {
+static void present_framebuffer() {
     u8 *src = second_buffer;
     u8 *dst = (u8*)fb->fb_addr;
 
@@ -184,7 +210,7 @@ void present_framebuffer() {
     }
 }
 
-void clearframe_win(Window *window, u32 color) {
+static void clearframe_win(Window *window, u32 color) {
     if (!window || !window->buffer)
         return;
 
@@ -196,11 +222,11 @@ void clearframe_win(Window *window, u32 color) {
     }
 }
 
-void clearframe() {
+static void clearframe() {
     memset(second_buffer, 0, fb->screen_height*fb->screen_pitch);
 }
 
-void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
+static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
 {
     if (x >= window->width || y >= window->height)
         return;
@@ -208,7 +234,7 @@ void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
     window->buffer[y * window->width + x] = color;
 }
 
-void draw_line_hor_window(Window *window, u32 startx, u32 endx, u32 y, u32 color) {
+static void draw_line_hor_window(Window *window, u32 startx, u32 endx, u32 y, u32 color) {
     for (u32 x = startx; x < endx; x++)
         put_pixel_window(window, x, y, color);
 }
@@ -231,17 +257,17 @@ static void put_pixel_cursor(u32 x, u32 y, u32 color) {
     *pixel |= color;
 }
 
-void draw_line_hor(u32 startx, u32 endx, u32 y, u32 color) {
+static void draw_line_hor(u32 startx, u32 endx, u32 y, u32 color) {
     for (u32 x = startx; x < endx; x++)
         put_pixel(x, y, color);
 }
 
-void draw_line_ver(u32 starty, u32 endy, u32 x, u32 color) {
+static void draw_line_ver(u32 starty, u32 endy, u32 x, u32 color) {
     for (u32 y = starty; y < endy; y++)
         put_pixel(x, y, color);
 }
 
-void draw_char(Window *window, u8 code, u32 x, u32 y, u32 color)
+static void draw_char(Window *window, u8 code, u32 x, u32 y, u32 color)
 {
     for (u32 row = 0; row < 16; row++) {
         for (u32 col = 0; col < 8; col++) {
@@ -251,7 +277,7 @@ void draw_char(Window *window, u8 code, u32 x, u32 y, u32 color)
     }
 }
 
-void draw_string(Window *window, const char *str, u32 x, u32 y, u32 color)
+static void draw_string(Window *window, const char *str, u32 x, u32 y, u32 color)
 {
     while (*str) {
         draw_char(window, (u8)*str, x, y, color);
@@ -260,7 +286,7 @@ void draw_string(Window *window, const char *str, u32 x, u32 y, u32 color)
     }
 }
 
-void draw_border_window(Window *window, u32 color) {
+static void draw_border_window(Window *window, u32 color) {
     u32 *top = &window->buffer[0];
     u32 *bottom = &window->buffer[(window->height - 1) * window->width];
 
@@ -275,7 +301,7 @@ void draw_border_window(Window *window, u32 color) {
     }
 }
 
-void window_fill_rect(Window *window, u32 x, u32 y, u32 width, u32 height, u32 color)
+static void window_fill_rect(Window *window, u32 x, u32 y, u32 width, u32 height, u32 color)
 {
     u32 *first_row = &window->buffer[y * window->width + x];
 
@@ -288,7 +314,7 @@ void window_fill_rect(Window *window, u32 x, u32 y, u32 width, u32 height, u32 c
     }
 }
 
-void present_window(Window *window) {
+static void present_window(Window *window) {
     s32 src_x = 0;
     s32 src_y = 0;
     s32 dst_x = window->x;
@@ -327,10 +353,10 @@ void present_window(Window *window) {
     }
 }
 
-void draw_mouse() {
+static void draw_mouse(u32 (*mouse_now)[6]) {
     for (u32 dy = 0; dy < 11; dy++) {
         for (u32 dx = 0; dx < 6; dx++) {
-            if (!arrow_cursor[dy][dx])
+            if (!mouse_now[dy][dx])
                 continue;
 
             s32 px = (s32)mouse_x + (s32)dx;
@@ -346,18 +372,18 @@ void draw_mouse() {
     }
 }
 
-void compositor_present() {
+static void compositor_present(u32 (*mouse_now)[6]) {
     clearframe();
 
     for (u32 i = 0; i < window_count; i++){
         present_window(z_order[i]);
     }
 
-    draw_mouse();
+    draw_mouse(mouse_now);
     present_framebuffer();
 }
 
-void filled_circle(Window *window, int cx, int cy, int radius, int color) {
+static void filled_circle(Window *window, int cx, int cy, int radius, int color) {
     int radius_squared = radius * radius;
 
     for (int x = -radius; x <= radius; x++) {
@@ -372,7 +398,7 @@ void filled_circle(Window *window, int cx, int cy, int radius, int color) {
     }
 }
 
-void window_raise(Window *window) {
+static void window_raise(Window *window) {
     if(window == 0)
         return;
 
@@ -394,7 +420,7 @@ void window_raise(Window *window) {
     z_order[window_count-1] = window;
 }
 
-void window_resize(Window *window, s32 new_width, s32 new_height) {
+static void window_resize(Window *window, s32 new_width, s32 new_height) {
     if (!window)
         return;
 
@@ -433,7 +459,7 @@ void window_resize(Window *window, s32 new_width, s32 new_height) {
     window->height = (s32)nh;
 }
 
-void window_switch_next()
+static void window_switch_next()
 {
     if (window_count == 0)
         return;
@@ -461,7 +487,7 @@ void window_switch_next()
     changed = true;
 }
 
-void resize_active_window(s32 dw, s32 dh)
+static void resize_active_window(s32 dw, s32 dh)
 {
     if (active_window == 0)
         return;
@@ -485,7 +511,7 @@ void resize_active_window(s32 dw, s32 dh)
     changed = true;
 }
 
-void draw_icons_window(Window *window) {
+static void draw_icons_window(Window *window) {
     s32 icon_pos = window->width - 70;
 
     for (u32 dy = 0; dy < 5; dy++) {
@@ -525,7 +551,7 @@ void draw_icons_window(Window *window) {
     }
 }
 
-void window_render(Window *window) {
+static void window_render(Window *window) {
     clearframe_win(window, 0xFFAAAAAA);
     
     window_fill_rect(window, 0, 0, window->width, 20, 0xFFFFFFFF);
@@ -548,6 +574,27 @@ u32 clamp(s32 value, s32 min, s32 max)
     return value;
 }
 
+static void window_full_screen(Window *window, bool full_screen) {
+
+    if (full_screen){
+        old_x = active_window->x;
+        old_y = active_window->y;
+        old_width = active_window->width;
+        old_height = active_window->height;
+
+        window->x = 1;
+        window->y = 1;
+
+        window_resize(window, 798, 598); 
+    } else {
+        window->x = old_x;
+        window->y = old_y;
+
+        window_resize(window, old_width, old_height);
+    }
+    changed = true;
+}
+
 INIT void init(void* _resolve_function(char* name))
 {
     printf = _resolve_function("_printf");
@@ -559,6 +606,15 @@ INIT void init(void* _resolve_function(char* name))
     get_mouse_y = _resolve_function("_get_mouse_y");
     get_mouse_left = _resolve_function("_get_mouse_left");
     get_mouse_right = _resolve_function("_get_mouse_right");
+    register_function = _resolve_function("_register_function");
+
+    register_function("_window_create", window_create, "Create window");
+    register_function("_window_render", window_render, "Render window");
+    register_function("_clearframe_win", clearframe_win, "Clearframe windows");
+    register_function("_window_fill_rect", window_fill_rect, "Draw window fill rect");
+    register_function("_draw_string", draw_string, "Draw string");
+    register_function("_draw_border_window", draw_border_window, "Draw border for window");
+    register_function("_compositor_present", compositor_present, "Draw in main framebuffer");
 
     get_key_state_matrix = _resolve_function("_get_key_state_matrix");
     bool *key_state_matrix = get_key_state_matrix();
@@ -587,15 +643,17 @@ INIT void init(void* _resolve_function(char* name))
 
     Window *window1 = window_create("window1");
     Window *window2 = window_create("window2");
-    Window *window3 = window_create("window3");
+    // Window *window3 = window_create("window3");
 
     window_render(window1);
     window_render(window2);
-    window_render(window3);
+    // window_render(window3);
 
-    active_window = window3;
+    active_window = window2;
 
-    compositor_present();
+    u32 (*mouse_now)[6] = arrow_cursor;
+
+    compositor_present(mouse_now);
 
     s32 old_mouse_x = get_mouse_x();
     s32 old_mouse_y = get_mouse_y();
@@ -605,10 +663,17 @@ INIT void init(void* _resolve_function(char* name))
 
     u32 drag_offsets_x;
     u32 drag_offsets_y;
+    s32 old_width, old_height;
+    s32 resize_start_x = 0, resize_start_y = 0;
+    s32 old_x, old_y = 0;
 
     bool dragging = false;
+    bool size_changed = false;
+    bool on_left, on_right, on_top, on_down;
 
     while(1){
+        mouse_now = arrow_cursor;
+
         mouse_x = get_mouse_x();
         mouse_y = get_mouse_y();
 
@@ -623,57 +688,145 @@ INIT void init(void* _resolve_function(char* name))
         bool right_released = !right && old_right;
 
         if (left_pressed) {
-            for (u32 i = 0; i < window_count; i++){
-                Window *window = z_order[i];
-                if (mouse_x >= window->x && mouse_x < window->x + window->width && mouse_y >= window->y && mouse_y < window->y + window->height) {
-                    active_window = window;
-                    window_raise(window);
-                }
+            Window *hit = 0;
+            for (u32 i = window_count; i > 0; i--){
+                Window *window = z_order[i - 1];
 
-                drag_offsets_x = mouse_x - window->x;
-                drag_offsets_y = mouse_y - window->y;
-
-                if (mouse_x >= window->x && mouse_x < window->x + window->width && mouse_y >= window->y && mouse_y < window->y + 20) {
-                    dragging = true;
+                if (mouse_x >= window->x &&
+                    mouse_x < window->x + window->width &&
+                    mouse_y >= window->y &&
+                    mouse_y < window->y + window->height) {
+                    hit = window;
+                    break;
                 }
-                
-                if (drag_offsets_y >= 0 && drag_offsets_y < 20) {
-                    s32 Collapse = window->width - 70;
-                    s32 full_screen = window->width - 50;
-                    s32 close  = window->width - 25;
+            }
+
+            dragging = false;
+            size_changed = false;
+
+            if (hit) {
+                active_window = hit;
+                window_raise(hit);
+
+                drag_offsets_x = mouse_x - hit->x;
+                drag_offsets_y = mouse_y - hit->y;
+
+                bool in_tittle = drag_offsets_y < 20;
+                bool tittle_button_clicked = false;
+
+                if (in_tittle) {
+                    s32 Collapse = hit->width - 70;
+                    s32 full_screen = hit->width - 50;
+                    s32 close  = hit->width - 25;
 
                     if ((drag_offsets_x - Collapse) * (drag_offsets_x - Collapse) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
-                        window->invisible = 1;
+                        hit->invisible = 1;
+                        changed = true;
+                        tittle_button_clicked = true;
                     }
-
                     if ((drag_offsets_x - full_screen) * (drag_offsets_x - full_screen) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
-                        // действие красной кнопки
+                        window_full = !window_full;
+                        window_full_screen(hit, window_full);
+                        tittle_button_clicked = true;
                     }
 
                     if ((drag_offsets_x - close) * (drag_offsets_x - close) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
-                        window_destroy(active_window);
+                        window_destroy(hit);
+                        tittle_button_clicked = true;
+                    }
+
+                    if (hit && !tittle_button_clicked) {
+                        dragging = true;
+                    }
+                } else{
+                    on_left = drag_offsets_x < 10;
+                    on_right = drag_offsets_x >= hit->width - 10;
+                    on_top = drag_offsets_y < 3;
+                    on_down = drag_offsets_y >= hit->height - 10;
+
+                    if (on_left || on_down || on_right || on_top) {
+                        old_width = hit->width;
+                        old_height = hit->height;
+                        old_x = hit->x;
+                        old_y = hit->y;
+                        resize_start_x = mouse_x;
+                        resize_start_y = mouse_y;
+                        size_changed = true;
                     }
                 }
-
             }
         }
 
-        if (left_hold && dragging && active_window) {
+        if (left_hold && active_window) {
             s32 new_x = mouse_x - drag_offsets_x;
             s32 new_y = mouse_y - drag_offsets_y;
 
-            new_x = clamp(new_x, 0, (s32)fb->screen_width - active_window->width);
+            if (dragging) {
+                new_x = clamp(new_x, 0, (s32)fb->screen_width - active_window->width);
 
-            new_y = clamp(new_y, 0, (s32)fb->screen_height - active_window->height);
+                new_y = clamp(new_y, 0, (s32)fb->screen_height - active_window->height);
 
-            if (active_window->x != new_x || active_window->y != new_y) {
-                active_window->x = new_x;
-                active_window->y = new_y;
+                if (active_window->x != new_x || active_window->y != new_y) {
+                    active_window->x = new_x;
+                    active_window->y = new_y;
+                    changed = true;
+                }
+            }
+
+            if (size_changed) {
+                s32 dx = mouse_x - resize_start_x;
+                s32 dy = mouse_y - resize_start_y;
+                s32 x = resize_start_x;
+                s32 y = resize_start_y;
+                s32 width = old_width;
+                s32 height = old_height;
+
+                if (on_left) {
+                    width = old_width - dx;
+                    x = resize_start_x + old_width - width;
+
+                    active_window->x = new_x;
+                    mouse_now = arrow_cursor_width;
+                }
+
+                if (on_right) {
+                    width = old_width + dx;
+                    mouse_now = arrow_cursor_width;
+                }
+
+                if(on_down) {
+                    height = old_height + dy;
+                    mouse_now = arrow_cursor_height;
+                }
+
+                if (on_top) {
+                    height = old_height - dy;
+                    y = resize_start_y + old_height - height;
+                    mouse_now = arrow_cursor_height;
+                }
+
+                if (on_down && on_left) {
+                    width = old_width - dx;
+                    x = resize_start_x + old_width - width;
+                    height = old_height + dy;
+
+                    active_window->x = new_x;
+                }
+
+                if (on_down && on_right) {
+                    height = old_height + dy;
+                    mouse_now = arrow_cursor_height;
+
+                    width = old_width + dx;
+                }
+
+                window_resize(active_window, width, height);
                 changed = true;
             }
         }
 
         if (left_released) {
+            size_changed = false;
             dragging = false;
         }
         
@@ -715,7 +868,7 @@ INIT void init(void* _resolve_function(char* name))
             if (changed)
                 window_render(active_window);
 
-            compositor_present();
+            compositor_present(mouse_now);
 
             old_mouse_x = mouse_x;
             old_mouse_y = mouse_y;
