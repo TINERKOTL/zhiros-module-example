@@ -30,9 +30,7 @@ struct fb_info* (*fbcon_stop)();
 
 struct fb_info* fb;
 
-typedef struct Window Window;
-
-struct Window{
+typedef struct Window{
     s32 x,y;
 
     s32 width, height;
@@ -41,21 +39,109 @@ struct Window{
     bool old_keys[256];
 
     char *name;
-};
+    bool full_screen;
+} Window;
+
+typedef struct DirtyRect {
+    s32 x,y,w,h;
+    bool valid;
+} DirtyRect;
+
+static DirtyRect dirty = {0,0,0,0, false};
+
+static s32 dirty_min(s32 a, s32 b) {
+    return a < b ? a : b;
+}
+
+static s32 dirty_max(s32 a, s32 b) {
+    return a > b ? a : b;
+}
+
+static void dirty_rect_union(s32 x, s32 y, s32 w, s32 h) {
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (!dirty.valid) {
+        dirty.x = x;
+        dirty.y = y;
+        dirty.w = w;
+        dirty.h = h;
+        dirty.valid = true;
+        return;
+    }
+
+    s32 x0 = dirty_min(dirty.x, x);
+    s32 y0 = dirty_min(dirty.y, y);
+    s32 x1 = dirty_max(dirty.x + dirty.w, x + w);
+    s32 y1 = dirty_max(dirty.y + dirty.h, y + h);
+
+    dirty.x = x0;
+    dirty.y = y0;
+    dirty.w = x1 - x0;
+    dirty.h = y1 - y0;
+    dirty.valid = true;
+}
 
 bool changed = false;
-static bool window_full = false;
+bool mouse_changed = false;
 
 u8 *second_buffer = 0;
 u32 second_buffer_size = 0;
 u32 mouse_x = 0, mouse_y = 0;
 u32 old_x, old_y, old_width, old_height;
+s32 prev_mouse_x = -1, prev_mouse_y = -1;
+s32 prev_window_x = -1, prev_window_y = -1;
 
 Window windows[MAX_WINDOWS];
 Window *z_order[MAX_WINDOWS];
 u32 window_count = 0;
 Window *active_window = 0;
 u32 active_index = 0;
+
+static const u32 wallpaper_16x16[] = {
+    0xFF000000, 0xFF111111, 0xFF222222, 0xFF333333,
+    0xFF111111, 0xFF222222, 0xFF333333, 0xFF444444,
+    0xFF222222, 0xFF333333, 0xFF444444, 0xFF555555,
+    0xFF333333, 0xFF444444, 0xFF555555, 0xFF666666
+};
+
+static u32 desktop_palette[] = {
+    0xFF1A1A1A,  // тёмно-серый
+    0xFF2E3A59,  // синий
+    0xFF234E3A,  // зелёный
+    0xFF4A2D2D,  // тёплый красный
+    0xFF3A2F50   // фиолетовый
+};
+
+static u32 desktop_bg_color = 0xFF1A1A1A;
+static u32 *desktop_bitmap = 0;
+
+static u32 desktop_pattern_color(u32 x, u32 y) {
+    u32 grid = 24;
+
+    if ((x % grid) < 2 || (y % grid) < 2)
+        return 0xFF4A2D2D;
+
+    return 0xFF1A1A1A;
+}
+
+u32 *desktop_background_buffer = 0;
+
+static void build_desktop_background() {
+    if (!desktop_background_buffer) {
+        desktop_background_buffer = alloc(second_buffer_size);
+        if (!desktop_background_buffer)
+            return;
+    }
+
+    u32 *pix = desktop_background_buffer;
+
+    for (u32 y = 0; y < fb->screen_height; y++) {
+        for (u32 x = 0; x < fb->screen_width; x++) {
+            pix[y * (fb->screen_pitch / 4) + x] = desktop_pattern_color(x, y);
+        }
+    }
+}
 
 static u32 arrow_cursor[11][6] = {
     {1, 0, 0, 0, 0, 0},
@@ -128,6 +214,8 @@ static const u32 window_icon_3[10][8] = {
     {0, 0, 1, 1, 1, 1, 1, 1},
 };
 
+u32 (*mouse_now)[6] = arrow_cursor;
+
 static Window *free_window_slot() {
     for (u32 i = 0; i < MAX_WINDOWS; i++) {
         if (windows[i].buffer == 0)
@@ -154,6 +242,7 @@ static Window *window_create(char *name) {
     window->height = 300;
     window->invisible = 0;
     window->name = name;
+    window->full_screen = false;
 
     window->buffer_size = window->width*window->height;
 
@@ -170,44 +259,46 @@ static Window *window_create(char *name) {
     return window;
 }
 
-static void window_destroy(Window *window) {
-    if (!window)
-        return;
-    
-    u32 index = 0;
-
-    while (index < window_count && z_order[index] != window)
-        index++;
-    
-    if (index >= window_count)
-        return;
-
-    for (u32 i = index; i + 1 < window_count; i++)
-        z_order[i] = z_order[i+1];
-
-    window_count--;
-
-    if(active_window == window) {
-        if (window_count > 0)
-            active_window = z_order[window_count - 1];
-        else
-            active_window = 0;
-    }
-
-    free(window->buffer);
-    window->buffer = 0;
-    window->buffer_size = 0;
-
-    changed = true;
-}
-
 static void present_framebuffer() {
-    u8 *src = second_buffer;
-    u8 *dst = (u8*)fb->fb_addr;
+    if (!dirty.valid)
+        return;
 
-    for (u32 i = 0; i < fb->screen_height; i++){
-        memcpy(dst + i*fb->screen_pitch,src + i*fb->screen_pitch,fb->screen_pitch);
+    s32 x = dirty.x;
+    s32 y = dirty.y;
+    s32 w = dirty.w;
+    s32 h = dirty.h;
+
+    if (x < 0) {
+        w += x;
+        x = 0;
     }
+
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+
+    if (x + w > (s32)fb->screen_width)
+        w = (s32)fb->screen_width - x;
+
+    if (y + h > (s32)fb->screen_height)
+        h = (s32)fb->screen_height - y;
+
+    if (w <= 0 || h <= 0) {
+        dirty.valid = false;
+        return;
+    }
+
+    u8 *src = second_buffer + (y * fb->screen_pitch) + (x * fb->bpp);
+    u8 *dst = ((u8 *)fb->fb_addr) + (y * fb->screen_pitch) + (x * fb->bpp);
+
+    for (s32 row = 0; row < h; row++) {
+        memcpy(dst + row * fb->screen_pitch,
+               src + row * fb->screen_pitch,
+               (u32)w * fb->bpp);
+    }
+
+    dirty.valid = false;
 }
 
 static void clearframe_win(Window *window, u32 color) {
@@ -223,7 +314,7 @@ static void clearframe_win(Window *window, u32 color) {
 }
 
 static void clearframe() {
-    memset(second_buffer, 0, fb->screen_height*fb->screen_pitch);
+    memcpy(second_buffer, desktop_background_buffer, fb->screen_height*fb->screen_pitch);
 }
 
 static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
@@ -234,37 +325,27 @@ static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
     window->buffer[y * window->width + x] = color;
 }
 
-static void draw_line_hor_window(Window *window, u32 startx, u32 endx, u32 y, u32 color) {
-    for (u32 x = startx; x < endx; x++)
-        put_pixel_window(window, x, y, color);
-}
-
 static void put_pixel(u32 x, u32 y, u32 color) {
-    volatile u32 *pixel = (volatile u32*)(second_buffer + y * fb->screen_pitch + x * fb->bpp);
+    u32 *pixel = (u32*)(second_buffer + y * fb->screen_pitch + x * fb->bpp);
     *pixel &= 0xFF000000;
     if(fb->bpp == 4) *pixel |= 0xFF000000;
     *pixel |= color;
 }
 
-static void put_pixel_cursor(u32 x, u32 y, u32 color) {
-    if (x < 0 || y < 0 ||
-        x >= (s32)fb->screen_width ||
-        y >= (s32)fb->screen_height)
-        return;
-    volatile u32 *pixel = (volatile u32*)(second_buffer + y * fb->screen_pitch + x * fb->bpp);
-    *pixel &= 0xFF000000;
-    if(fb->bpp == 4) *pixel |= 0xFF000000;
-    *pixel |= color;
-}
+static void blit_bitmap(u32 *bitmap, u32 w, u32 h, u32 x, u32 y) {
+    for (u32 py = 0; py < h; py++) {
+        for (u32 px = 0; px < w; px++) {
+            u32 color = bitmap[py * w + px];
 
-static void draw_line_hor(u32 startx, u32 endx, u32 y, u32 color) {
-    for (u32 x = startx; x < endx; x++)
-        put_pixel(x, y, color);
-}
+            u32 dst_x = x + px;
+            u32 dst_y = y + py;
 
-static void draw_line_ver(u32 starty, u32 endy, u32 x, u32 color) {
-    for (u32 y = starty; y < endy; y++)
-        put_pixel(x, y, color);
+            if (dst_x >= fb->screen_width || dst_y >= fb->screen_height)
+                continue;
+
+            put_pixel(dst_x, dst_y, color);
+        }
+    }
 }
 
 static void draw_char(Window *window, u8 code, u32 x, u32 y, u32 color)
@@ -323,6 +404,22 @@ static void present_window(Window *window) {
     s32 copy_width = window->width;
     s32 copy_height = window->height;
 
+    if (window->full_screen) {
+        s32 h = copy_height < (s32)fb->screen_height ? copy_height : (s32)fb->screen_height;
+        u32 row_bytes = (u32)copy_width * sizeof(u32);
+        if (row_bytes > fb->screen_pitch)
+            row_bytes = fb->screen_pitch;
+
+        for (s32 row = 0; row < h; row++) {
+            u8 *dst = second_buffer + row * fb->screen_pitch;
+            u8 *src = (u8 *)&window->buffer[row * window->width];
+            memcpy(dst, src, row_bytes);
+        }
+
+        dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
+        return;
+    }
+
     if (dst_x < 0) {
         src_x = -dst_x;
         copy_width -= src_x;
@@ -353,7 +450,28 @@ static void present_window(Window *window) {
     }
 }
 
+static void clear_mouse_old_area(s32 x, s32 y) {
+    for (s32 dy = 0; dy < 11; dy++) {
+        for (s32 dx = 0; dx < 6; dx++) {
+            s32 px = x + dx;
+            s32 py = y + dy;
+
+            if (px < 0 || py < 0 ||
+                px >= (s32)fb->screen_width ||
+                py >= (s32)fb->screen_height)
+                continue;
+
+            u32 *pixel = (u32 *)(second_buffer + py * fb->screen_pitch + px * fb->bpp);
+            *pixel = desktop_background_buffer[py * (fb->screen_pitch / 4) + px];
+        }
+    }
+}
+
 static void draw_mouse(u32 (*mouse_now)[6]) {
+    if (prev_mouse_x >= 0 && prev_mouse_y >= 0 && (prev_mouse_x != mouse_x || prev_mouse_y != mouse_y)){
+        dirty_rect_union(prev_mouse_x, prev_mouse_y, 6, 11);
+    }
+    
     for (u32 dy = 0; dy < 11; dy++) {
         for (u32 dx = 0; dx < 6; dx++) {
             if (!mouse_now[dy][dx])
@@ -367,23 +485,33 @@ static void draw_mouse(u32 (*mouse_now)[6]) {
                 py >= (s32)fb->screen_height)
                 continue;
 
-            put_pixel_cursor((u32)px, (u32)py, 0x00FF0000);
+            put_pixel((u32)px, (u32)py, 0x00FF0000);
         }
     }
+    dirty_rect_union(mouse_x, mouse_y, 6, 11);
+
+    prev_mouse_x = mouse_x;
+    prev_mouse_y = mouse_y;
 }
 
-static void compositor_present(u32 (*mouse_now)[6]) {
-    clearframe();
+static void compositor_present() {
+    if (!active_window || !active_window->full_screen)
+        clearframe();
 
     for (u32 i = 0; i < window_count; i++){
-        present_window(z_order[i]);
+        Window *window = z_order[i];
+
+        if (!window || window->invisible)
+            continue;
+
+        present_window(window);
     }
 
     draw_mouse(mouse_now);
     present_framebuffer();
 }
 
-static void filled_circle(Window *window, int cx, int cy, int radius, int color) {
+/*static void filled_circle(Window *window, int cx, int cy, int radius, int color) {
     int radius_squared = radius * radius;
 
     for (int x = -radius; x <= radius; x++) {
@@ -396,7 +524,7 @@ static void filled_circle(Window *window, int cx, int cy, int radius, int color)
             }
         }
     }
-}
+}*/
 
 static void window_raise(Window *window) {
     if(window == 0)
@@ -424,19 +552,28 @@ static void window_resize(Window *window, s32 new_width, s32 new_height) {
     if (!window)
         return;
 
+    s32 old_x = window->x;
+    s32 old_y = window->y;
+    s32 old_w = window->width;
+    s32 old_h = window->height;
+
     u32 nw = (u32)new_width;
     u32 nh = (u32)new_height;
 
     if (nw == 0 || nh == 0)
         return;
 
-    if (nw > MAX_WINDOW_WIDTH)
-        nw = MAX_WINDOW_WIDTH;
-    if (nh > MAX_WINDOW_HEIGHT)
-        nh = MAX_WINDOW_HEIGHT;
+    if (!window->full_screen) {
+        if (nw > MAX_WINDOW_WIDTH)
+            nw = MAX_WINDOW_WIDTH;
+        if (nh > MAX_WINDOW_HEIGHT)
+            nh = MAX_WINDOW_HEIGHT;
+    }
 
     if (nw == (u32)window->width && nh == (u32)window->height)
         return;
+
+    dirty_rect_union(old_x, old_y, old_w, old_h);
 
     u32 *new_buffer = alloc(nw * nh * sizeof(u32));
     if (!new_buffer)
@@ -457,6 +594,8 @@ static void window_resize(Window *window, s32 new_width, s32 new_height) {
     window->buffer_size = nw * nh;
     window->width = (s32)nw;
     window->height = (s32)nh;
+
+    dirty_rect_union(window->x, window->y, nw, nh);
 }
 
 static void window_switch_next()
@@ -576,22 +715,69 @@ u32 clamp(s32 value, s32 min, s32 max)
 
 static void window_full_screen(Window *window, bool full_screen) {
 
-    if (full_screen){
-        old_x = active_window->x;
-        old_y = active_window->y;
-        old_width = active_window->width;
-        old_height = active_window->height;
+    if (full_screen) {
+        old_x = window->x;
+        old_y = window->y;
+        old_width = window->width;
+        old_height = window->height;
 
-        window->x = 1;
-        window->y = 1;
+        window->full_screen = true;
+        window->x = 0;
+        window->y = 0;
 
-        window_resize(window, 798, 598); 
+        dirty_rect_union(old_x, old_y, old_width, old_height);
+
+        window_resize(window, fb->screen_width, fb->screen_height);
+        window_render(window);
+
+        dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
     } else {
+        dirty_rect_union(window->x, window->y, window->width, window->height);
+
+        window->full_screen = false;
         window->x = old_x;
         window->y = old_y;
 
         window_resize(window, old_width, old_height);
+        window_render(window);
     }
+    changed = true;
+}
+
+static void window_destroy(Window *window) {
+    if (!window)
+        return;
+
+    dirty_rect_union(window->x, window->y, window->width, window->height);
+    
+    u32 index = 0;
+
+    while (index < window_count && z_order[index] != window)
+        index++;
+    
+    if (index >= window_count)
+        return;
+
+    for (u32 i = index; i + 1 < window_count; i++)
+        z_order[i] = z_order[i+1];
+
+    window_count--;
+
+    if(active_window == window) {
+        active_window = 0;
+
+        for (u32 i = 0;i < window_count; i++) {
+            if (z_order[i] && !z_order[i]->invisible) {
+                active_window = z_order[i];
+                break;
+            }
+        }
+    }
+
+    free(window->buffer);
+    window->buffer = 0;
+    window->buffer_size = 0;
+
     changed = true;
 }
 
@@ -639,6 +825,7 @@ INIT void init(void* _resolve_function(char* name))
 
     memset(second_buffer, 0, second_buffer_size);
 
+    build_desktop_background();
     clearframe();
 
     Window *window1 = window_create("window1");
@@ -651,9 +838,8 @@ INIT void init(void* _resolve_function(char* name))
 
     active_window = window2;
 
-    u32 (*mouse_now)[6] = arrow_cursor;
-
-    compositor_present(mouse_now);
+    dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
+    compositor_present();
 
     s32 old_mouse_x = get_mouse_x();
     s32 old_mouse_y = get_mouse_y();
@@ -687,10 +873,23 @@ INIT void init(void* _resolve_function(char* name))
         bool right_pressed = right && !old_right;
         bool right_released = !right && old_right;
 
+        if (active_window && active_window->invisible) {
+            active_window = 0;
+            for (u32 i = 0; i < window_count; i++) {
+                if (z_order[i] && !z_order[i]->invisible) {
+                    active_window = z_order[i];
+                    break;
+                }
+            }
+        }   
+
         if (left_pressed) {
             Window *hit = 0;
             for (u32 i = window_count; i > 0; i--){
                 Window *window = z_order[i - 1];
+                
+                if (window->invisible)
+                    continue;
 
                 if (mouse_x >= window->x &&
                     mouse_x < window->x + window->width &&
@@ -720,13 +919,13 @@ INIT void init(void* _resolve_function(char* name))
                     s32 close  = hit->width - 25;
 
                     if ((drag_offsets_x - Collapse) * (drag_offsets_x - Collapse) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
-                        hit->invisible = 1;
+                        active_window->invisible = 1;
                         changed = true;
                         tittle_button_clicked = true;
                     }
                     if ((drag_offsets_x - full_screen) * (drag_offsets_x - full_screen) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
-                        window_full = !window_full;
-                        window_full_screen(hit, window_full);
+                        hit->full_screen = !hit->full_screen;
+                        window_full_screen(hit, hit->full_screen);
                         tittle_button_clicked = true;
                     }
 
@@ -762,18 +961,27 @@ INIT void init(void* _resolve_function(char* name))
             s32 new_y = mouse_y - drag_offsets_y;
 
             if (dragging) {
-                new_x = clamp(new_x, 0, (s32)fb->screen_width - active_window->width);
+                s32 old_rect_x = active_window->x;
+                s32 old_rect_y = active_window->y;
+                s32 old_rect_w = active_window->width;
+                s32 old_rect_h = active_window->height;
 
+                new_x = clamp(new_x, 0, (s32)fb->screen_width - active_window->width);
                 new_y = clamp(new_y, 0, (s32)fb->screen_height - active_window->height);
 
                 if (active_window->x != new_x || active_window->y != new_y) {
+                    dirty_rect_union(old_rect_x, old_rect_y, old_rect_w, old_rect_h);
                     active_window->x = new_x;
                     active_window->y = new_y;
+                    dirty_rect_union(active_window->x, active_window->y, active_window->width, active_window->height);
+                
                     changed = true;
                 }
             }
 
             if (size_changed) {
+                dirty_rect_union(active_window->x, active_window->y, active_window->width, active_window->height);
+
                 s32 dx = mouse_x - resize_start_x;
                 s32 dy = mouse_y - resize_start_y;
                 s32 x = resize_start_x;
@@ -785,7 +993,7 @@ INIT void init(void* _resolve_function(char* name))
                     width = old_width - dx;
                     x = resize_start_x + old_width - width;
 
-                    active_window->x = new_x;
+                    active_window->x = x;
                     mouse_now = arrow_cursor_width;
                 }
 
@@ -810,7 +1018,7 @@ INIT void init(void* _resolve_function(char* name))
                     x = resize_start_x + old_width - width;
                     height = old_height + dy;
 
-                    active_window->x = new_x;
+                    active_window->x = x;
                 }
 
                 if (on_down && on_right) {
@@ -830,45 +1038,45 @@ INIT void init(void* _resolve_function(char* name))
             dragging = false;
         }
         
-        if (key_state_matrix[wcode] && active_window->y > 20){
+        if (active_window && key_state_matrix[wcode] && active_window->y > 20){
             active_window->y -= 25;
             changed = true;
         }
         
-        if (key_state_matrix[scode] && active_window->y+active_window->height < (s32)fb->screen_height){
+        if (active_window && key_state_matrix[scode] && active_window->y+active_window->height < (s32)fb->screen_height){
             active_window->y += 25;
             changed = true;
         }
 
-        if (key_state_matrix[acode] && active_window->x > 0){
+        if (active_window && key_state_matrix[acode] && active_window->x > 0){
             active_window->x -= 25;
             changed = true;
         }
 
-        if (key_state_matrix[dcode] && active_window->x+active_window->width < (s32)fb->screen_width){
+        if (active_window && key_state_matrix[dcode] && active_window->x+active_window->width < (s32)fb->screen_width){
             active_window->x += 25;
             changed = true;
         }
 
-        if (key_state_matrix[pluscode]){
+        if (active_window && key_state_matrix[pluscode]){
             resize_active_window(50,50);
         }
 
-        if (key_state_matrix[mincode]){
+        if (active_window && key_state_matrix[mincode]){
             resize_active_window(-50,-50);
         }
         
-        if (key_state_matrix[onecode] && !old_window){
+        if (active_window && key_state_matrix[onecode] && !old_window){
             window_switch_next();
         }   
 
         bool mouse_changed = mouse_x != old_mouse_x || mouse_y != old_mouse_y;
 
         if (changed || mouse_changed) {
-            if (changed)
+            if (active_window && changed)
                 window_render(active_window);
 
-            compositor_present(mouse_now);
+            compositor_present();
 
             old_mouse_x = mouse_x;
             old_mouse_y = mouse_y;
