@@ -8,18 +8,14 @@
 
 2) Добавляем в конце init.h строчку:
 load_mod(ramdisk_letter,"./window_manager.mod");
-
-3) Добавляем в build32.sh после строчки "#compile modules": 
-gcc $MODULE_FLAGS -c window_manager.c -o build/module.o
-ld -m elf_i386 -T module.ld build/module.o -o build/module.elf
-objcopy --set-section-flags .bss=alloc,load,contents -O binary build/module.elf ramdisk/window_manager.mod
+(каждый новый модуль добавлять после window_manager)
 
 ## API WM для модулей:
 ### Взаимодействие с окном
 ```c
 _window_create(const char *name) -> struct
 _window_render(Window *window) -> None
-_compositor_present(u32 (*mouse_now)[6]) -> None //mouse_now это двухмерный массив, в котором хранится курсор с помощью 0 и 1, где 0 - none, 1 - цвет
+_compositor_present() -> None 
 ```
 
 ### Рисование окна и его содержимого
