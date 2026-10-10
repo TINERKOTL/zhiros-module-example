@@ -3,17 +3,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-
-// typedef unsigned long uintptr_t;
-
 // by TINERKOTL
 #include "lib/zhirtypes.h"
+#include "WM_types.h"
 #include "fonts/font8x16.h"
 #include "lib/string.h"
-
-#define MAX_WINDOWS 8
-#define MAX_WINDOW_WIDTH 800
-#define MAX_WINDOW_HEIGHT 600
 
 u32 (*getchar)();
 void *(*alloc)(u32 size);
@@ -25,29 +19,41 @@ s32 (*get_mouse_y)();
 s32 (*get_mouse_left)();
 s32 (*get_mouse_right)();
 void (*register_function)(char *function_name, void* call, char *description);
+void (*print_color)(char*,u32);
+struct file* (*open)(char diskletter, char* path);
+void (*sleep)(u32 ms);
+u32 (*getticks)();
 
 struct fb_info* (*fbcon_stop)();
 
 struct fb_info* fb;
 
-typedef struct Window{
-    s32 x,y;
-
-    s32 width, height;
-    bool invisible;
-    u32 *buffer, buffer_size;
-    bool old_keys[256];
-
-    char *name;
-    bool full_screen;
-} Window;
-
-typedef struct DirtyRect {
-    s32 x,y,w,h;
-    bool valid;
-} DirtyRect;
-
 static DirtyRect dirty = {0,0,0,0, false};
+
+#define MAX_WINDOWS 8
+#define MAX_WINDOW_WIDTH 800
+#define MAX_WINDOW_HEIGHT 600
+
+bool changed = false;
+bool mouse_changed = false;
+
+u8 *second_buffer = 0;
+u32 second_buffer_size = 0;
+u32 mouse_x = 0, mouse_y = 0;
+s32 prev_mouse_x = -1, prev_mouse_y = -1;
+s32 prev_window_x = -1, prev_window_y = -1;
+struct image *ptica_img;
+
+Window windows[MAX_WINDOWS];
+Window *z_order[MAX_WINDOWS];
+u32 mouse_backup[11][6];
+bool mouse_backup_valid = false;
+u32 window_count = 0;
+Window *active_window = 0;
+u32 active_index = 0;
+u32 fps_frames = 0;
+u32 fps_last_tick = 0;
+u32 fps_value = 0;
 
 static s32 dirty_min(s32 a, s32 b) {
     return a < b ? a : b;
@@ -81,22 +87,6 @@ static void dirty_rect_union(s32 x, s32 y, s32 w, s32 h) {
     dirty.h = y1 - y0;
     dirty.valid = true;
 }
-
-bool changed = false;
-bool mouse_changed = false;
-
-u8 *second_buffer = 0;
-u32 second_buffer_size = 0;
-u32 mouse_x = 0, mouse_y = 0;
-u32 old_x, old_y, old_width, old_height;
-s32 prev_mouse_x = -1, prev_mouse_y = -1;
-s32 prev_window_x = -1, prev_window_y = -1;
-
-Window windows[MAX_WINDOWS];
-Window *z_order[MAX_WINDOWS];
-u32 window_count = 0;
-Window *active_window = 0;
-u32 active_index = 0;
 
 static const u32 wallpaper_16x16[] = {
     0xFF000000, 0xFF111111, 0xFF222222, 0xFF333333,
@@ -216,6 +206,19 @@ static const u32 window_icon_3[10][8] = {
 
 u32 (*mouse_now)[6] = arrow_cursor;
 
+static void fps_on_present(void) {
+    fps_frames++;
+
+    u32 now = getticks();
+    u32 elapsed = now - fps_last_tick; // корректно и при переполнении u32
+
+    if (elapsed >= 1000) {
+        fps_value = fps_frames * 1000 / elapsed;
+        fps_frames = 0;
+        fps_last_tick = now;
+    }
+}
+
 static Window *free_window_slot() {
     for (u32 i = 0; i < MAX_WINDOWS; i++) {
         if (windows[i].buffer == 0)
@@ -240,6 +243,12 @@ static Window *window_create(char *name) {
     window->y = 200;
     window->width = 400;
     window->height = 300;
+
+    // window->x = 0;
+    // window->y = 0;
+    // window->width = 800;
+    // window->height = 600;
+
     window->invisible = 0;
     window->name = name;
     window->full_screen = false;
@@ -257,6 +266,47 @@ static Window *window_create(char *name) {
     window_count++;
 
     return window;
+}
+
+static void restore_rect_from_background(s32 x, s32 y, s32 w, s32 h) {
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+
+    if (x + w > (s32)fb->screen_width)
+        w = (s32)fb->screen_width - x;
+
+    if (y + h > (s32)fb->screen_height)
+        h = (s32)fb->screen_height - y;
+
+    if (w <= 0 || h <= 0)
+        return;
+
+    for (s32 row = 0; row < h; row++) {
+        u8 *dst = second_buffer + (y + row) * fb->screen_pitch + x * fb->bpp;
+        u8 *src = (u8 *)desktop_background_buffer +
+                  ((y + row) * (fb->screen_pitch / 4) + x) * sizeof(u32);
+
+        memcpy(dst, src, (u32)w * sizeof(u32));
+    }
+
+    dirty_rect_union(x, y, w, h);
+}
+
+static void window_restore_old_area(Window *window) {
+    if (!window)
+        return;
+
+    restore_rect_from_background(window->x, window->y, window->width, window->height);
 }
 
 static void present_framebuffer() {
@@ -293,12 +343,12 @@ static void present_framebuffer() {
     u8 *dst = ((u8 *)fb->fb_addr) + (y * fb->screen_pitch) + (x * fb->bpp);
 
     for (s32 row = 0; row < h; row++) {
-        memcpy(dst + row * fb->screen_pitch,
-               src + row * fb->screen_pitch,
-               (u32)w * fb->bpp);
+        memcpy(dst + row * fb->screen_pitch, src + row * fb->screen_pitch, (u32)w * fb->bpp);
     }
 
     dirty.valid = false;
+
+    // fps_on_present();
 }
 
 static void clearframe_win(Window *window, u32 color) {
@@ -315,6 +365,7 @@ static void clearframe_win(Window *window, u32 color) {
 
 static void clearframe() {
     memcpy(second_buffer, desktop_background_buffer, fb->screen_height*fb->screen_pitch);
+    // memset(second_buffer, 0, fb->screen_height*fb->screen_pitch);
 }
 
 static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
@@ -326,26 +377,12 @@ static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
 }
 
 static void put_pixel(u32 x, u32 y, u32 color) {
+    if (x >= fb->screen_width || y >= fb->screen_height) return;
+
     u32 *pixel = (u32*)(second_buffer + y * fb->screen_pitch + x * fb->bpp);
     *pixel &= 0xFF000000;
     if(fb->bpp == 4) *pixel |= 0xFF000000;
     *pixel |= color;
-}
-
-static void blit_bitmap(u32 *bitmap, u32 w, u32 h, u32 x, u32 y) {
-    for (u32 py = 0; py < h; py++) {
-        for (u32 px = 0; px < w; px++) {
-            u32 color = bitmap[py * w + px];
-
-            u32 dst_x = x + px;
-            u32 dst_y = y + py;
-
-            if (dst_x >= fb->screen_width || dst_y >= fb->screen_height)
-                continue;
-
-            put_pixel(dst_x, dst_y, color);
-        }
-    }
 }
 
 static void draw_char(Window *window, u8 code, u32 x, u32 y, u32 color)
@@ -441,6 +478,8 @@ static void present_window(Window *window) {
     if (copy_width <= 0 || copy_height <= 0)
         return;
 
+    dirty_rect_union(dst_x, dst_y, copy_width, copy_height);
+
     for (s32 y = 0; y < copy_height; y++) {
         u8 *dst = second_buffer + (dst_y + y) * fb->screen_pitch + dst_x * fb->bpp;
 
@@ -467,11 +506,45 @@ static void clear_mouse_old_area(s32 x, s32 y) {
     }
 }
 
-static void draw_mouse(u32 (*mouse_now)[6]) {
-    if (prev_mouse_x >= 0 && prev_mouse_y >= 0 && (prev_mouse_x != mouse_x || prev_mouse_y != mouse_y)){
+static void draw_mouse() {
+    if (prev_mouse_x >= 0 && prev_mouse_y >= 0 &&
+        (prev_mouse_x != mouse_x || prev_mouse_y != mouse_y)) {
+
+        for (u32 dy = 0; dy < 11; dy++) {
+            for (u32 dx = 0; dx < 6; dx++) {
+                s32 px = prev_mouse_x + (s32)dx;
+                s32 py = prev_mouse_y + (s32)dy;
+
+                if (px < 0 || py < 0 ||
+                    px >= (s32)fb->screen_width ||
+                    py >= (s32)fb->screen_height)
+                    continue;
+
+                u32 *p = (u32 *)(second_buffer + py * fb->screen_pitch + px * fb->bpp);
+                mouse_backup[dy][dx] = *p;
+            }
+        }
+
+        mouse_backup_valid = true;
+
+        for (u32 dy = 0; dy < 11; dy++) {
+            for (u32 dx = 0; dx < 6; dx++) {
+                s32 px = prev_mouse_x + (s32)dx;
+                s32 py = prev_mouse_y + (s32)dy;
+
+                if (px < 0 || py < 0 ||
+                    px >= (s32)fb->screen_width ||
+                    py >= (s32)fb->screen_height)
+                    continue;
+
+                u32 *p = (u32 *)(second_buffer + py * fb->screen_pitch + px * fb->bpp);
+                *p = mouse_backup[dy][dx];
+            }
+        }
+
         dirty_rect_union(prev_mouse_x, prev_mouse_y, 6, 11);
     }
-    
+
     for (u32 dy = 0; dy < 11; dy++) {
         for (u32 dx = 0; dx < 6; dx++) {
             if (!mouse_now[dy][dx])
@@ -488,6 +561,7 @@ static void draw_mouse(u32 (*mouse_now)[6]) {
             put_pixel((u32)px, (u32)py, 0x00FF0000);
         }
     }
+
     dirty_rect_union(mouse_x, mouse_y, 6, 11);
 
     prev_mouse_x = mouse_x;
@@ -507,7 +581,7 @@ static void compositor_present() {
         present_window(window);
     }
 
-    draw_mouse(mouse_now);
+    draw_mouse();
     present_framebuffer();
 }
 
@@ -594,8 +668,6 @@ static void window_resize(Window *window, s32 new_width, s32 new_height) {
     window->buffer_size = nw * nh;
     window->width = (s32)nw;
     window->height = (s32)nh;
-
-    dirty_rect_union(window->x, window->y, nw, nh);
 }
 
 static void window_switch_next()
@@ -690,6 +762,13 @@ static void draw_icons_window(Window *window) {
     }
 }
 
+static void drawimage(Window *window, struct image*img,int startx,int starty)
+{
+    for(int x = 0;x<img->width;x++)
+        for(int y = 0;y<img->height;y++)
+            put_pixel_window(window, x+startx, y+starty, img->bytes[y*img->width+x]);
+}
+
 static void window_render(Window *window) {
     clearframe_win(window, 0xFFAAAAAA);
     
@@ -714,18 +793,17 @@ u32 clamp(s32 value, s32 min, s32 max)
 }
 
 static void window_full_screen(Window *window, bool full_screen) {
-
     if (full_screen) {
-        old_x = window->x;
-        old_y = window->y;
-        old_width = window->width;
-        old_height = window->height;
+        window->prev_x = window->x;
+        window->prev_y = window->y;
+        window->prev_width = window->width;
+        window->prev_height = window->height;
 
         window->full_screen = true;
         window->x = 0;
         window->y = 0;
 
-        dirty_rect_union(old_x, old_y, old_width, old_height);
+        dirty_rect_union(window->prev_x, window->prev_y, window->prev_width, window->prev_height);
 
         window_resize(window, fb->screen_width, fb->screen_height);
         window_render(window);
@@ -733,12 +811,11 @@ static void window_full_screen(Window *window, bool full_screen) {
         dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
     } else {
         dirty_rect_union(window->x, window->y, window->width, window->height);
-
         window->full_screen = false;
-        window->x = old_x;
-        window->y = old_y;
+        window->x = window->prev_x;
+        window->y = window->prev_y;
 
-        window_resize(window, old_width, old_height);
+        window_resize(window, window->prev_width,  window->prev_height);
         window_render(window);
     }
     changed = true;
@@ -748,7 +825,7 @@ static void window_destroy(Window *window) {
     if (!window)
         return;
 
-    dirty_rect_union(window->x, window->y, window->width, window->height);
+    window_restore_old_area(window);
     
     u32 index = 0;
 
@@ -786,6 +863,7 @@ INIT void init(void* _resolve_function(char* name))
     printf = _resolve_function("_printf");
     getchar = _resolve_function("_getchar");
     fbcon_stop = _resolve_function("_fbcon_stop");
+    open = _resolve_function("_open");
     alloc = _resolve_function("_alloc");
     free = _resolve_function("_free");
     get_mouse_x = _resolve_function("_get_mouse_x");
@@ -793,6 +871,9 @@ INIT void init(void* _resolve_function(char* name))
     get_mouse_left = _resolve_function("_get_mouse_left");
     get_mouse_right = _resolve_function("_get_mouse_right");
     register_function = _resolve_function("_register_function");
+    print_color = _resolve_function("_print_color");
+    sleep = _resolve_function("_sleep_ms");
+    getticks = _resolve_function("_getticks");
 
     register_function("_window_create", window_create, "Create window");
     register_function("_window_render", window_render, "Render window");
@@ -813,7 +894,12 @@ INIT void init(void* _resolve_function(char* name))
     u8 mincode = ascii_to_keycode['-'];
     u8 onecode = ascii_to_keycode['1'];
 
-    bool old_window;
+    struct file *ptica = open('A',"./ptica.zi");
+    int size = ptica->getsize(ptica);
+    struct image *ptica_img = alloc(size);
+    ptica->read(ptica, ptica_img, size, 0);
+
+    bool old_window = false;
 
     fb = fbcon_stop();
 
@@ -829,14 +915,14 @@ INIT void init(void* _resolve_function(char* name))
     clearframe();
 
     Window *window1 = window_create("window1");
-    Window *window2 = window_create("window2");
+    // Window *window2 = window_create("window2");
     // Window *window3 = window_create("window3");
 
     window_render(window1);
-    window_render(window2);
+    // window_render(window2);
     // window_render(window3);
 
-    active_window = window2;
+    // active_window = window2;
 
     dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
     compositor_present();
@@ -856,6 +942,8 @@ INIT void init(void* _resolve_function(char* name))
     bool dragging = false;
     bool size_changed = false;
     bool on_left, on_right, on_top, on_down;
+
+    fps_last_tick = getticks();
 
     while(1){
         mouse_now = arrow_cursor;
@@ -891,10 +979,7 @@ INIT void init(void* _resolve_function(char* name))
                 if (window->invisible)
                     continue;
 
-                if (mouse_x >= window->x &&
-                    mouse_x < window->x + window->width &&
-                    mouse_y >= window->y &&
-                    mouse_y < window->y + window->height) {
+                if (mouse_x >= window->x && mouse_x < window->x + window->width && mouse_y >= window->y && mouse_y < window->y + window->height) {
                     hit = window;
                     break;
                 }
@@ -906,6 +991,7 @@ INIT void init(void* _resolve_function(char* name))
             if (hit) {
                 active_window = hit;
                 window_raise(hit);
+                dirty_rect_union(hit->x, hit->y, hit->width, hit->height);
 
                 drag_offsets_x = mouse_x - hit->x;
                 drag_offsets_y = mouse_y - hit->y;
@@ -922,6 +1008,7 @@ INIT void init(void* _resolve_function(char* name))
                         active_window->invisible = 1;
                         changed = true;
                         tittle_button_clicked = true;
+                        dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
                     }
                     if ((drag_offsets_x - full_screen) * (drag_offsets_x - full_screen) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
                         hit->full_screen = !hit->full_screen;
@@ -980,8 +1067,6 @@ INIT void init(void* _resolve_function(char* name))
             }
 
             if (size_changed) {
-                dirty_rect_union(active_window->x, active_window->y, active_window->width, active_window->height);
-
                 s32 dx = mouse_x - resize_start_x;
                 s32 dy = mouse_y - resize_start_y;
                 s32 x = resize_start_x;
@@ -1081,11 +1166,13 @@ INIT void init(void* _resolve_function(char* name))
             old_mouse_x = mouse_x;
             old_mouse_y = mouse_y;
             changed = false;
+            // printf(fps_frames);
         }
 
         old_window = key_state_matrix[onecode];
 
         old_left = left;
         old_right = right;
+
     }
 }
