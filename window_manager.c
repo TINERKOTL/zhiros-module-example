@@ -4,10 +4,7 @@
  */
 
 // by TINERKOTL
-#include "lib/zhirtypes.h"
-#include "WM_types.h"
-#include "fonts/font8x16.h"
-#include "lib/string.h"
+#include "../WM_types.h"
 
 u32 (*getchar)();
 void *(*alloc)(u32 size);
@@ -16,13 +13,18 @@ void (*printf)(char* fmt, ...);
 bool *(*get_key_state_matrix)();
 s32 (*get_mouse_x)();
 s32 (*get_mouse_y)();
-s32 (*get_mouse_left)();
-s32 (*get_mouse_right)();
+bool (*get_mouse_left)();
+bool (*get_mouse_right)();
 void (*register_function)(char *function_name, void* call, char *description);
 void (*print_color)(char*,u32);
 struct file* (*open)(char diskletter, char* path);
 void (*sleep)(u32 ms);
 u32 (*getticks)();
+void (*yield)();
+
+struct task* (*create_task)(char *name, void* function);
+
+struct task* task;
 
 struct fb_info* (*fbcon_stop)();
 
@@ -49,11 +51,11 @@ Window *z_order[MAX_WINDOWS];
 u32 mouse_backup[11][6];
 bool mouse_backup_valid = false;
 u32 window_count = 0;
-Window *active_window = 0;
 u32 active_index = 0;
 u32 fps_frames = 0;
 u32 fps_last_tick = 0;
 u32 fps_value = 0;
+Window *active_window = 0;
 
 static s32 dirty_min(s32 a, s32 b) {
     return a < b ? a : b;
@@ -244,11 +246,6 @@ static Window *window_create(char *name) {
     window->width = 400;
     window->height = 300;
 
-    // window->x = 0;
-    // window->y = 0;
-    // window->width = 800;
-    // window->height = 600;
-
     window->invisible = 0;
     window->name = name;
     window->full_screen = false;
@@ -264,6 +261,8 @@ static Window *window_create(char *name) {
     z_order[window_count] = window;
 
     window_count++;
+
+    active_window = window;
 
     return window;
 }
@@ -365,7 +364,6 @@ static void clearframe_win(Window *window, u32 color) {
 
 static void clearframe() {
     memcpy(second_buffer, desktop_background_buffer, fb->screen_height*fb->screen_pitch);
-    // memset(second_buffer, 0, fb->screen_height*fb->screen_pitch);
 }
 
 static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
@@ -781,7 +779,7 @@ static void window_render(Window *window) {
     draw_border_window(window, 0xFFFFFFFF);
 }
 
-u32 clamp(s32 value, s32 min, s32 max)
+static u32 clamp(s32 value, s32 min, s32 max)
 {
     if (value < min)
         return min;
@@ -858,34 +856,11 @@ static void window_destroy(Window *window) {
     changed = true;
 }
 
-INIT void init(void* _resolve_function(char* name))
-{
-    printf = _resolve_function("_printf");
-    getchar = _resolve_function("_getchar");
-    fbcon_stop = _resolve_function("_fbcon_stop");
-    open = _resolve_function("_open");
-    alloc = _resolve_function("_alloc");
-    free = _resolve_function("_free");
-    get_mouse_x = _resolve_function("_get_mouse_x");
-    get_mouse_y = _resolve_function("_get_mouse_y");
-    get_mouse_left = _resolve_function("_get_mouse_left");
-    get_mouse_right = _resolve_function("_get_mouse_right");
-    register_function = _resolve_function("_register_function");
-    print_color = _resolve_function("_print_color");
-    sleep = _resolve_function("_sleep_ms");
-    getticks = _resolve_function("_getticks");
+static bool window_is_active(Window *window) {
+    return window && window == active_window && !window->invisible;
+}
 
-    register_function("_window_create", window_create, "Create window");
-    register_function("_window_render", window_render, "Render window");
-    register_function("_clearframe_win", clearframe_win, "Clearframe windows");
-    register_function("_window_fill_rect", window_fill_rect, "Draw window fill rect");
-    register_function("_draw_string", draw_string, "Draw string");
-    register_function("_draw_border_window", draw_border_window, "Draw border for window");
-    register_function("_compositor_present", compositor_present, "Draw in main framebuffer");
-
-    get_key_state_matrix = _resolve_function("_get_key_state_matrix");
-    bool *key_state_matrix = get_key_state_matrix();
-
+static void init_WM() {
     u8 wcode = ascii_to_keycode['w'];
     u8 dcode = ascii_to_keycode['d'];
     u8 scode = ascii_to_keycode['s'];
@@ -894,10 +869,12 @@ INIT void init(void* _resolve_function(char* name))
     u8 mincode = ascii_to_keycode['-'];
     u8 onecode = ascii_to_keycode['1'];
 
-    struct file *ptica = open('A',"./ptica.zi");
-    int size = ptica->getsize(ptica);
-    struct image *ptica_img = alloc(size);
-    ptica->read(ptica, ptica_img, size, 0);
+    bool *key_state_matrix = get_key_state_matrix();
+
+    // struct file *ptica = open('A',"./ptica.zi");
+    // int size = ptica->getsize(ptica);
+    // struct image *ptica_img = alloc(size);
+    // ptica->read(ptica, ptica_img, size, 0);
 
     bool old_window = false;
 
@@ -913,16 +890,6 @@ INIT void init(void* _resolve_function(char* name))
 
     build_desktop_background();
     clearframe();
-
-    Window *window1 = window_create("window1");
-    // Window *window2 = window_create("window2");
-    // Window *window3 = window_create("window3");
-
-    window_render(window1);
-    // window_render(window2);
-    // window_render(window3);
-
-    // active_window = window2;
 
     dirty_rect_union(0, 0, fb->screen_width, fb->screen_height);
     compositor_present();
@@ -1018,6 +985,7 @@ INIT void init(void* _resolve_function(char* name))
 
                     if ((drag_offsets_x - close) * (drag_offsets_x - close) + (drag_offsets_y - 10) * (drag_offsets_y - 10) <= 49) {
                         window_destroy(hit);
+                        
                         tittle_button_clicked = true;
                     }
 
@@ -1061,8 +1029,6 @@ INIT void init(void* _resolve_function(char* name))
                     active_window->x = new_x;
                     active_window->y = new_y;
                     dirty_rect_union(active_window->x, active_window->y, active_window->width, active_window->height);
-                
-                    changed = true;
                 }
             }
 
@@ -1122,39 +1088,7 @@ INIT void init(void* _resolve_function(char* name))
             size_changed = false;
             dragging = false;
         }
-        
-        if (active_window && key_state_matrix[wcode] && active_window->y > 20){
-            active_window->y -= 25;
-            changed = true;
-        }
-        
-        if (active_window && key_state_matrix[scode] && active_window->y+active_window->height < (s32)fb->screen_height){
-            active_window->y += 25;
-            changed = true;
-        }
-
-        if (active_window && key_state_matrix[acode] && active_window->x > 0){
-            active_window->x -= 25;
-            changed = true;
-        }
-
-        if (active_window && key_state_matrix[dcode] && active_window->x+active_window->width < (s32)fb->screen_width){
-            active_window->x += 25;
-            changed = true;
-        }
-
-        if (active_window && key_state_matrix[pluscode]){
-            resize_active_window(50,50);
-        }
-
-        if (active_window && key_state_matrix[mincode]){
-            resize_active_window(-50,-50);
-        }
-        
-        if (active_window && key_state_matrix[onecode] && !old_window){
-            window_switch_next();
-        }   
-
+    
         bool mouse_changed = mouse_x != old_mouse_x || mouse_y != old_mouse_y;
 
         if (changed || mouse_changed) {
@@ -1166,13 +1100,43 @@ INIT void init(void* _resolve_function(char* name))
             old_mouse_x = mouse_x;
             old_mouse_y = mouse_y;
             changed = false;
-            // printf(fps_frames);
         }
-
-        old_window = key_state_matrix[onecode];
 
         old_left = left;
         old_right = right;
 
+        yield();
     }
+}
+
+INIT void init(void* _resolve_function(char* name))
+{
+    printf = _resolve_function("_printf");
+    getchar = _resolve_function("_getchar");
+    fbcon_stop = _resolve_function("_fbcon_stop");
+    open = _resolve_function("_open");
+    alloc = _resolve_function("_alloc");
+    free = _resolve_function("_free");
+    get_mouse_x = _resolve_function("_get_mouse_x");
+    get_mouse_y = _resolve_function("_get_mouse_y");
+    get_mouse_left = _resolve_function("_get_mouse_left");
+    get_mouse_right = _resolve_function("_get_mouse_right");
+    register_function = _resolve_function("_register_function");
+    print_color = _resolve_function("_print_color");
+    sleep = _resolve_function("_sleep_ms");
+    getticks = _resolve_function("_getticks");
+    create_task = _resolve_function("_create_task");
+    yield = _resolve_function("_yield");
+    get_key_state_matrix = _resolve_function("_get_key_state_matrix");
+
+    register_function("_window_create", window_create, "Create window");
+    register_function("_window_render", window_render, "Render window");
+    register_function("_clearframe_win", clearframe_win, "Clearframe windows");
+    register_function("_window_fill_rect", window_fill_rect, "Draw window fill rect");
+    register_function("_draw_string", draw_string, "Draw string");
+    register_function("_draw_border_window", draw_border_window, "Draw border for window");
+    register_function("_compositor_present", compositor_present, "Draw in main framebuffer");
+    register_function("_window_is_active", window_is_active, "Check active window");
+
+    create_task("Windows_Manager", init_WM);
 }

@@ -1,3 +1,7 @@
+#include "lib/zhirtypes.h"
+#include "lib/string.h"
+#include "fonts/font8x16.h"
+
 typedef struct Window{
     s32 x,y;
 
