@@ -2,6 +2,11 @@
 #include "lib/string.h"
 #include "fonts/font8x16.h"
 
+typedef struct Window Window;
+
+typedef void (*WindowResizeCallback)(Window *window, s32 old_width, s32 old_height);
+typedef void (*DesktopIconDraw)(u32 x, u32 y, u32 size);
+
 typedef struct Window{
     s32 x,y;
 
