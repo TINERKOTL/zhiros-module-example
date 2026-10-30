@@ -7,8 +7,9 @@ typedef struct Window Window;
 typedef void (*WindowResizeCallback)(Window *window, s32 old_width, s32 old_height);
 typedef void (*DesktopIconDraw)(u32 x, u32 y, u32 size);
 
-typedef struct Window{
+struct Window{
     s32 x,y;
+    bool window_on_changed;
 
     s32 width, height;
     bool invisible;
@@ -19,7 +20,10 @@ typedef struct Window{
 
     s32 prev_x, prev_y, prev_width, prev_height;
     bool full_screen;
-} Window;
+    WindowResizeCallback on_resize;
+
+    struct task *task;
+};
 
 typedef struct DirtyRect {
     s32 x,y,w,h;
@@ -31,3 +35,11 @@ struct image{
     u16 height;
     u32 bytes[0];
 };
+
+typedef struct {
+    u32 x;
+    u32 y;
+    u32 size;
+    DesktopIconDraw draw;
+} DesktopIcon;
+
