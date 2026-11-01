@@ -1,11 +1,10 @@
 /*
- * Copyright (c) 2026 ilizavr & yellowhat
+ * Copyright (c) 2026 ilizavr & TINERKOTL & yellowhat
  * SPDX-License-Identifier: MIT
  */
 
-// by TINERKOTL
-#include "WM_types.h"
-#include "lib/zhirapi.h"
+#include "../mod.win/WM_types.h"
+#include "../lib/zhirapi.h"
 
 Window* (*window_create)(char *name);
 void (*window_render)(Window *window);
@@ -58,11 +57,15 @@ static u32 tmpfs_write(struct file *file, void* buffer, u32 size, u32 offset) {
             if (!new_data)
                 return 0;
             
-            memcpy(new_data, node->data, node->size);
-            free(node->data);
+            if (node->data){
+                memcpy(new_data, node->data, node->size);
+                free(node->data);
+            }
             node->capacity = last_position;
             node->data = new_data;
         }
+
+        memcpy(node->data + offset, buffer, size);
 
         if (offset > node->size) {
             for (u32 i = node->size; i < offset; i++)
@@ -71,10 +74,9 @@ static u32 tmpfs_write(struct file *file, void* buffer, u32 size, u32 offset) {
             node->size = offset;
         }
 
+
         if (last_position > node->size)
             node->size = last_position;
-
-        memcpy(node->data + offset, buffer, size);
 
         return size;
     } else {
@@ -124,9 +126,16 @@ static struct tmpfs_node *tmpfs_find_path(struct tmpfs *fs, const char *path) {
     return node;
 }
 
+static bool tmpfs_close(struct file *file) {
+    if (!file)
+        return false;
+    
+    return free(file);
+}
+
 static u32 tmpfs_read(struct file *file, void* buffer, u32 size, u32 offset) {
     if (!file || !buffer)
-    return 0;
+        return 0;
 
     struct tmpfs_node *node = file->other_info;
     if (!node)
@@ -267,7 +276,7 @@ static struct file *tmpfs_mkdir(struct disk *disk, char *path){
     file->read = tmpfs_read;
     file->write = 0;
     file->getsize = tmpfs_getsize;
-    file->close = 0;
+    file->close = tmpfs_close;
     file->other_info = node;
 
     return file;
@@ -298,7 +307,7 @@ static struct file *tmpfs_open(struct disk *disk, char *path) {
     file->read = tmpfs_read;
     file->write = tmpfs_write;
     file->getsize = tmpfs_getsize;
-    file->close = 0;
+    file->close = tmpfs_close;
     file->other_info = node;
 
     return file;
@@ -398,7 +407,7 @@ static struct file *tmpfs_create_file(struct disk *disk, char *path){
     file->read = tmpfs_read;
     file->write = tmpfs_write;
     file->getsize = tmpfs_getsize;
-    file->close = 0;
+    file->close = tmpfs_close;
     file->other_info = node;
 
     return file;
@@ -439,6 +448,23 @@ static char mount_tmpfs(struct tmpfs *fs) {
     return fs->mount_letter;
 }
 
+static char find_tmpfs_letter(void) {
+    for (u32 i = 0; i < MAX_DISK_COUNT; i++) {
+        struct disk *disk = getdisk(i);
+
+        if (disk && disk->name && 
+            disk->name[0] == 't' &&
+            disk->name[1] == 'm' &&
+            disk->name[2] == 'p' &&
+            disk->name[3] == 'f' &&
+            disk->name[4] == 's' &&
+            disk->name[5] == '\0')
+            return disk->mountletter;
+    }
+
+    return 0;
+}
+
 static struct tmpfs tmpfs_instance;
 
 INIT void init(void* _resolve_function(char* name))
@@ -454,25 +480,29 @@ INIT void init(void* _resolve_function(char* name))
     // create_task("terminal", your_name_func); //создание потока
 
     // printf("tmpfs: before mount\n");
+
+    register_function("_find_letter", find_tmpfs_letter, "");
+
     if (!mount_tmpfs(&tmpfs_instance))
         return;
     printf("tmpfs: mounted %c\n", tmpfs_instance.mount_letter);
     diskadd(tmpfs_instance.vfs_disk);
 
     struct file entrites[8];
-    u8 source[]= {'H', 'I', '!'};
+    u8 source[]= {'H', 'I', '!', '\n', 'H'};
     u8 result[sizeof(source)];
 
-    struct file *dir = mkdir(tmpfs_instance.mount_letter, "/tmp");
-    struct file *opened = open(tmpfs_instance.mount_letter, "/tmp");
-    struct file *new_file = create_file(tmpfs_instance.mount_letter, "/tmp/hi");
+    // struct file *dir = mkdir(tmpfs_instance.mount_letter, "/tmp");
+    // struct file *opened = open(tmpfs_instance.mount_letter, "/tmp");
+    struct file *new_file = create_file(tmpfs_instance.mount_letter, "/first.py");
+    struct file *opened = open(tmpfs_instance.mount_letter, "/first.py");
 
     if (opened)
         printf("tmpfs: open succeeded\n");
     else
         return;
 
-    printf("mkdir returned %x\n", dir);
+    // printf("mkdir returned %x\n", dir);
     printf("tmpfs: after open %x\n\n", opened);
     printf("tmpfs: file create %x\n\n", new_file);
 

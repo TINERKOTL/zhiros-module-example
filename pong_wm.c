@@ -4,7 +4,7 @@
  */
 
 // by TINERKOTL
-#include "../WM_types.h"
+#include "../mod.win/WM_types.h"
 
 u32 (*getchar)();
 void (*printf)(char* fmt, ...);
@@ -21,6 +21,9 @@ struct task* (*create_task)(char *name, void* function);
 struct task* (*get_task)();
 
 Window* (*window_create)(char *name);
+
+static Window *window;
+static struct task *pong_task;
 
 static void put_pixel_window(Window *window, u32 x, u32 y, u32 color)
 {
@@ -57,6 +60,26 @@ static bool collision(u32 cube_start, u32 cube_end, u32 platform_start, u32 plat
     return cube_end >= platform_start && cube_start <= platform_end;
 }
 
+static void clear_game_area(Window *window)
+{
+    if (!window || !window->buffer || window->width < 3 || window->height <= 20 + 1)
+        return;
+
+    for (u32 y = 20; y < (u32)window->height - 1; y++) {
+        for (u32 x = 1; x < (u32)window->width - 1; x++) {
+            window->buffer[y * window->width + x] = 0xFFAAAAAA;
+        }
+    }
+}
+
+static void pong_on_resize(Window *window, s32 old_width, s32 old_height)
+{
+    (void)old_width;
+    (void)old_height;
+
+    clear_game_area(window);
+}
+
 static void init_pong() {
     bool *key_state_matrix = get_key_state_matrix();
 
@@ -66,12 +89,17 @@ static void init_pong() {
     u8 wcode_j = ascii_to_keycode['j'];
     u8 wcode_l = ascii_to_keycode['l'];
 
-    Window *window = window_create("Pong Game");
+    window = window_create("Pong Game");
 
     if (!window)
         return;
 
+    window->task = pong_task;
+    window->on_resize = pong_on_resize;
+
     render_window(window);
+
+    clear_game_area(window);
 
     u32 x = window->width / 2 - 50, x_2 = window->width / 2 - 50, end_x = window->width / 2 + 50, end_x_2 = window->width / 2 + 50;
     
@@ -82,11 +110,13 @@ static void init_pong() {
     bool cube_direction_x = 1; // 1 - влево, 0 - вправо
     bool game_over = 0;
 
+    window->window_on_changed = true;
+
     draw_line(window, x, x + 100, window->height - 30, 0xFFFFFFFF);
     draw_line(window, x_2, x_2 + 100, 50, 0xFFFFFFFF);
 
     while (1) {
-        if (game_over == 0) {
+        if (1) {
             if (window_is_active(window)) {
                 if(key_state_matrix[wcode_a]) 
                     if (x > 0){
@@ -188,7 +218,7 @@ static void init_pong() {
             draw_string(window, "GAME OVER", 200, 100, 0xFFFFFF);
         }
         compositor_present();
-        yield();
+        sleep(10);
     }
 }
 
@@ -209,5 +239,5 @@ INIT void init(void* _resolve_function(char* name))
     get_task = _resolve_function("_get_tasks");
 
 
-    create_task("Pong", init_pong);
+    pong_task = create_task("pong", init_pong); //создание потока
 }

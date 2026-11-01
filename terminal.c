@@ -4,7 +4,7 @@
  */
 
 #include "../lib/zhirapi.h"
-#include "../WM_types.h"
+#include "WM_types.h"
 
 Window* (*window_create)(char *name);
 void (*window_render)(Window *window);
@@ -18,13 +18,14 @@ bool (*window_is_active)(Window *window);
 void (*desktop_fill_rect)(s32 x, s32 y, s32 width, s32 height, u32 color);
 void (*desktop_draw_string)(const char *text, u32 x, u32 y, u32 color);
 bool (*register_icon)(u32, u32, u32, DesktopIconDraw);
+void (*window_resize)(Window *window, s32 new_width, s32 new_height);
 
 
-static Window *terminal_window;
-struct task *terminal_task;
+static Window *terminal_window=0;
+struct task *terminal_task=0;
 
 static s32 curx=0, cury=20;
-volatile u32 fb_addr,fb_size,fb_size_withoutlastline,fb_lastline_addr,fb_onelinesize,fb_secondline_addr;
+volatile u32 fb_addr=0,fb_size=0,fb_size_withoutlastline=0,fb_lastline_addr=0,fb_onelinesize=0,fb_secondline_addr=0;
 volatile u32 screen_height = 0;
 
 static void clearframe_hook() {
@@ -59,38 +60,38 @@ void roll_screen()
 
 static void putchar_color_hook(char chr, u32 color)
 {
-    if(!terminal_window || !window_is_active(terminal_window)) return;
-
-    if(chr=='\n') {
-        putchar_color_hook(' ',color);
-        curx = 0;
-        cury+=16;
-        if((cury+16)>screen_height) {
-            roll_screen();
-            cury-=16;
+    if(window_is_active(terminal_window)){
+        if(chr=='\n') {
+            putchar_color_hook(' ',color);
+            curx = 0;
+            cury+=16;
+            if((cury+16)>screen_height) {
+                roll_screen();
+                cury-=16;
+            }
+            return;
         }
-        return;
-    }
-    if(curx > (terminal_window->width-8)) {
-        curx = 0;
-        cury+=16;
-        if((cury+16)>screen_height) {
-            roll_screen();
-            cury-=16;
+        if(curx > (terminal_window->width-8)) {
+            curx = 0;
+            cury+=16;
+            if((cury+16)>screen_height) {
+                roll_screen();
+                cury-=16;
+            }
         }
-    }
-    if(chr == '\b')
-    {
-        curx -= 8;
-        if(curx<0)
+        if(chr == '\b')
         {
-            curx = (terminal_window->width/8-1)*8;
-            cury -= 16;
+            curx -= 8;
+            if(curx<0)
+            {
+                curx = (terminal_window->width/8-1)*8;
+                cury -= 16;
+            }
+            return;
         }
-        return;
+        draw_char_bg(terminal_window,chr,curx,cury,color,0);
+        curx+=8;
     }
-    draw_char_bg(terminal_window,chr,curx,cury,color,0);
-    curx+=8;
 }
 
 // void draw_terminal_icon(u32 x, u32 y, u32 size) {
@@ -103,6 +104,7 @@ static void putchar_color_hook(char chr, u32 color)
 
 static void terminal_thread() {
     terminal_window = window_create("terminal");
+    if (!terminal_window) return;
     terminal_window->task = terminal_task;
     terminal_window->on_resize = terminal_on_resize;
 
@@ -115,6 +117,10 @@ static void terminal_thread() {
     fb_lastline_addr = fb_addr+fb_size_withoutlastline;
     fb_onelinesize = terminal_window->width*16*4;
     fb_secondline_addr = fb_addr+fb_onelinesize;
+
+    replace_function("_putchar_color",putchar_color_hook);
+    replace_function("_clearframe",clearframe_hook);
+
     clearframe_hook();
 
     while(1) {
@@ -143,9 +149,7 @@ INIT void init(void* _resolve_function(char* name))
     window_is_active = _resolve_function("_window_is_active");
     desktop_fill_rect = _resolve_function("_desktop_fill_rect");
     desktop_draw_string = _resolve_function("_desktop_draw_string");
+    window_resize = _resolve_function("_window_resize");
 
     terminal_task = create_task("terminal", terminal_thread); //создание потока
-
-    replace_function("_putchar_color",putchar_color_hook);
-    replace_function("_clearframe",clearframe_hook);
 }
